@@ -1,22 +1,19 @@
 {
   "version": 1,
-  "author": "Sulaimanov Baibol (cilan1m0)",
+  "author": "Sulaimanov Baibol (CilaNim)",
   "editor": "wokwi",
   "parts": [
-    { "type": "wokwi-esp32-devkit-v1", "id": "esp", "top": 0, "left": 0, "attrs": {} },
-    { "type": "wokwi-potentiometer", "id": "pot1", "top": -60, "left": -120, "attrs": {} },
-    { "type": "wokwi-led", "id": "led1", "top": -50, "left": 140, "attrs": { "color": "blue" } },
-    { "type": "wokwi-resistor", "id": "r1", "top": 30, "left": 140, "attrs": { "value": "220" } }
+    { "type": "board-esp32-devkit-c-v4", "id": "esp",  "top": 0,    "left": 0,   "attrs": {} },
+    { "type": "wokwi-potentiometer",     "id": "pot1", "top": -90,  "left": 140, "attrs": { "value": "1650" } },
+    { "type": "wokwi-resistor",          "id": "r1",   "top": 130,  "left": 210, "attrs": { "value": "220" } },
+    { "type": "wokwi-led",               "id": "led1", "top": 60,   "left": 300, "attrs": { "color": "red" } }
   ],
   "connections": [
-    [ "esp:TX0", "$serialMonitor:RX", "", [] ],
-    [ "esp:RX0", "$serialMonitor:TX", "", [] ],
-    [ "pot1:GND", "esp:GND.2", "black", [ "v0" ] ],
-    [ "pot1:VCC", "esp:3V3", "red", [ "v0" ] ],
-    [ "pot1:SIG", "esp:VP", "green", [ "v0" ] ],
-    [ "esp:D2", "led1:A", "blue", [ "v0" ] ],
-    [ "led1:C", "r1:1", "black", [ "v0" ] ],
-    [ "r1:2", "esp:GND.1", "black", [ "v0" ] ]
-  ],
-  "dependencies": {}
+    [ "esp:VP",    "pot1:SIG", "green",  [] ],
+    [ "esp:3V3",   "pot1:VCC", "red",    [] ],
+    [ "esp:GND.1", "pot1:GND", "black",  [] ],
+    [ "esp:D2",    "r1:1",     "orange", [] ],
+    [ "r1:2",      "led1:A",   "orange", [] ],
+    [ "led1:C",    "esp:GND.1","black",  [] ]
+  ]
 }
