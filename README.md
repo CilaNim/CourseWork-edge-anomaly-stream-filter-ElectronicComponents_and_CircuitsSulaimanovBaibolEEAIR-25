@@ -1,58 +1,67 @@
-# CourseWork-edge-anomaly-stream-filter-ElectronicComponents_and_CircuitsSulaimanovBaibolEEAIR-25
-# Edge Anomaly Stream Filter: Real-Time Z-Score Telemetry Filtering on ESP32
+<h1 align="center">🛰️ Edge Anomaly Stream Filter</h1>
 
-![Course](https://img.shields.io/badge/Course-EEAIR%20%2F%20Electronic%20Components-0052CC?style=for-the-badge)
-![Hardware](https://img.shields.io/badge/Hardware-ESP32%20WROOM--32-E7352C?style=for-the-badge&logo=espressif)
-![Firmware](https://img.shields.io/badge/Firmware-C%2B%2B17%20%2F%20PlatformIO-00599C?style=for-the-badge&logo=cplusplus)
-![Analytics](https://img.shields.io/badge/Analytics-Python%203.10-3776AB?style=for-the-badge&logo=python)
-![Protocol](https://img.shields.io/badge/Protocol-MQTT%20%2F%20Mosquitto-660066?style=for-the-badge&logo=eclipsemosquitto)
-![License](https://img.shields.io/badge/License-MIT-2ea44f?style=for-the-badge)
+<p align="center">
+  <em>Filtering bad sensor telemetry at the edge node before it reaches the cloud.</em>
+</p>
 
-**Author:** Sulaimanov Baibol ([@CilaNim](https://github.com/CilaNim) / `cilan1m0`)  
-**Course:** Electronic Components and Circuits / EEAIR  
-**Submission Deadline:** November 23, 2026  
-**Research Question:** *"What streaming anomaly threshold reduces cloud bandwidth by >40% without losing critical events?"*
-
----
-
-## 1. Project Overview & Architectural Motivation
-
-In high-frequency Industrial IoT (IIoT) deployments, streaming raw analog sensor telemetry directly to cloud ingestion pipelines saturates wireless links, increases broker CPU overhead, and depletes edge battery reserves. In practice, over 90% of continuous sensor observations represent stationary or quasi-stationary baseline behavior.
-
-The **Edge Anomaly Stream Filter** solves this bottleneck by embedding a lightweight, non-parametric statistical filter directly inside the microcontroller's SRAM:
-1. **Static Memory Safety:** Uses a statically allocated Ring Buffer ($N = 50$ floats, $200\text{ bytes}$ in BSS) on the ESP32 to compute rolling statistics without `malloc()`/`new` heap fragmentation.
-2. **Real-Time Statistical Evaluation:** Computes the rolling arithmetic mean ($\mu$), population standard deviation ($\sigma$), and standardized Z-Score ($Z = \frac{x - \mu}{\sigma}$) in $O(N)$ deterministic time at a $10\text{ Hz}$ sampling rate.
-3. **Selective MQTT Transmission:** Routine samples ($\vert{}Z\vert{} < \text{Z\_THRESHOLD}$) are discarded directly at the edge node. Only statistically significant anomalies ($\vert{}Z\vert{} \ge 2.5\sigma$) and initial warm-up samples ($n \le 50$) are serialized via `ArduinoJson` and published over Wi-Fi to an Eclipse Mosquitto MQTT broker.
+<p align="center">
+  <img src="https://img.shields.io/badge/course-EEAIR%20·%20Electronic%20Components%20%26%20Circuits-1f6feb?style=flat-square" alt="course">
+  <img src="https://img.shields.io/badge/student-Sulaimanov%20Baibol-8957e5?style=flat-square" alt="student">
+  <img src="https://img.shields.io/badge/handle-CilaNim%20·%20cilan1m0-2ea043?style=flat-square" alt="handle">
+  <img src="https://img.shields.io/badge/ESP32-WROOM--32-E7352C?style=flat-square&logo=espressif&logoColor=white" alt="esp32">
+  <img src="https://img.shields.io/badge/C%2B%2B-Arduino%20Framework-00599C?style=flat-square&logo=cplusplus&logoColor=white" alt="cpp">
+  <img src="https://img.shields.io/badge/Python-3.10-3776AB?style=flat-square&logo=python&logoColor=white" alt="python">
+  <img src="https://img.shields.io/badge/MQTT-Mosquitto-660066?style=flat-square&logo=eclipsemosquitto&logoColor=white" alt="mqtt">
+  <img src="https://img.shields.io/badge/simulator-Wokwi-FF6B35?style=flat-square" alt="wokwi">
+  <img src="https://img.shields.io/badge/bandwidth%20saved-90.3%25-brightgreen?style=flat-square" alt="bandwidth">
+  <img src="https://img.shields.io/badge/missed%20events-0.0%25-success?style=flat-square" alt="fnr">
+</p>
 
 ---
 
-## 2. System Dataflow Architecture
+## 🔬 Research Question
+
+> **"What streaming anomaly threshold reduces cloud bandwidth by >40 %
+> without losing critical events?"**
+
+**Answer established by this project:** the streaming Z-score threshold
+**σ = 2.5** reduces MQTT telemetry bandwidth by **90.3 %** while detecting
+**100 %** of the injected critical events (false-negative rate **0.0 %**)
+on a 120-second capture at 50 Hz.
+
+---
+
+## 🧭 Operational Overview
+
+A cheap analog sensor is sampled by an ESP32 at **50 Hz**. A **50-sample static
+ring buffer** maintains a rolling statistical window. For every new sample the
+node computes the window **mean (μ)** and **sample standard deviation (σ)** and
+the **Z-score**
+
+$$
+Z = \frac{x - \mu}{\sigma}
+$$
+
+The frame is **published over MQTT only when |Z| ≥ 2.5**. Nominal samples are
+discarded *on the microcontroller* — they never consume a TCP segment, never
+consume broker storage, and never consume cloud egress. During the 50-sample
+warm-up the node streams raw frames so the cloud keeps full observability while
+the statistics converge.
+
+---
+
+## 🗺️ System Dataflow
 
 ```mermaid
 flowchart LR
-    subgraph Physical_Layer ["Physical Layer (Analog Front-End)"]
-        A["Analog Sensor / Potentiometer\n(0.0V - 3.3V Signal + Spikes)"]
-    end
+    A["Analog Sensor<br/>Voltage Divider<br/>0.0 – 3.3 V"] --> B["ESP32 ADC<br/>GPIO36 · 12-bit<br/>0 … 4095"]
+    B --> C["Static Ring Buffer<br/>N = 50<br/>μ · σ · Z"]
+    C -->|"nominal sample<br/>Z below threshold"| D["DROPPED AT EDGE<br/>(never leaves the node)"]
+    C -->|"anomaly sample<br/>Z at or above threshold"| E["MQTT PUBLISH<br/>eeair/telemetry/anomaly"]
+    C --> F["GPIO2 LED<br/>220 Ω"]
+    E --> G["Eclipse Mosquitto<br/>Broker"]
+    G --> H["Cloud Storage<br/>Dashboard / DB"]
 
-    subgraph Edge_Node ["ESP32 NodeMCU (WROOM-32 Edge Node)"]
-        B["12-Bit SAR ADC\nGPIO36 (VP / ADC1_CH0)"]
-        C["Static Ring Buffer\n(Window Size N = 50)"]
-        D["Real-Time Z-Score Engine\nZ = (x - μ) / σ"]
-        E{"Is Warm-Up (n < 50)\nOR |Z| ≥ 2.5σ ?"}
-        F["Drop Packet at Edge\n(Increment Local Counter)"]
-        G["Trigger GPIO2 Status LED\n& Serialize JSON Payload"]
-    end
-
-    subgraph Network_Broker ["Local / Cloud Network"]
-        H["Eclipse Mosquitto\nMQTT Broker (:1883)"]
-        I["Cloud Analytics & Storage\n(bandwidth_analyzer.py)"]
-    end
-
-    A -->|"Continuous Voltage"| B
-    B -->|"10 Hz Sample"| D
-    C <-->|"Rolling μ, σ"| D
-    D --> E
-    E -->|"No (Routine Telemetry)"| F
-    E -->|"Yes (Anomaly / Warm-Up)"| G
-    G -->|"MQTT Publish (QoS 0)"| H
-    H -->|"Subscribed Topic"| I
+    style D fill:#ffe6e6,stroke:#d62728,stroke-width:2px
+    style E fill:#e6ffe6,stroke:#2ea043,stroke-width:2px
+    style C fill:#e6f0ff,stroke:#1f6feb,stroke-width:2px
