@@ -1,355 +1,219 @@
-/**
- * @file main.cpp
- * @author Sulaimanov Baibol (GitHub: CilaNim / cilan1m0)
- * @brief Edge Anomaly Stream Filter for ESP32 NodeMCU (WROOM-32)
- * @course Electronic Components and Circuits / EEAIR
- * @date November 2026
- *
- * @details
- * Implements a statically allocated Ring Buffer (N=50) and real-time Z-Score
- * anomaly detector on an ESP32 edge node. Routine sensor telemetry is filtered
- * locally at the edge; only statistically significant anomalies (|Z| >= 2.5)
- * or initial buffer warm-up samples are serialized into JSON and transmitted
- * over Wi-Fi to an Eclipse Mosquitto MQTT broker.
- */
-
 #include <Arduino.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <math.h>
 
-// 1. NETWORK & MQTT CONFIGURATION
-constexpr char WIFI_SSID[]     = "EEAIR_Lab_Network";
-constexpr char WIFI_PASSWORD[] = "Baibol_IoT_2026!";
-constexpr char MQTT_BROKER[]   = "192.168.1.100";
-constexpr uint16_t MQTT_PORT   = 1883;
-constexpr char MQTT_CLIENT_ID[]= "esp32_edge_node_cilan1m0";
-constexpr char MQTT_TOPIC[]    = "eeair/cilan1m0/edge/telemetry";
+static const char* WIFI_SSID     = "Wokwi-GUEST";
+static const char* WIFI_PASSWORD = "";
+static const char*    MQTT_HOST      = "test.mosquitto.org";
+static const uint16_t MQTT_PORT      = 1883;
+static const char*    MQTT_CLIENT_ID = "esp32-edge-node-cilan1m0";
 
-// 2. HARDWARE PIN DEFINITIONS & ADC CONSTANTS
-constexpr uint8_t PIN_ANALOG_SENSOR = 36; // GPIO36 (VP / ADC1_CH0 - Input Only)
-constexpr uint8_t PIN_STATUS_LED    = 2;  // GPIO2 (Onboard Blue LED)
-constexpr float ADC_MAX_VALUE       = 4095.0f; // 12-bit SAR ADC (0 - 4095)
-constexpr float ADC_REF_VOLTAGE     = 3.3f;    // Reference voltage (3.3V)
-
-// 3. STATISTICAL FILTER HYPERPARAMETERS
-constexpr size_t WINDOW_SIZE        = 50;      // Statically allocated Ring Buffer size (N=50)
-constexpr float Z_THRESHOLD         = 2.5f;    // Anomaly threshold (|Z| >= 2.5 sigma)
-constexpr float EPSILON             = 1e-6f;   // Guard against zero-variance division
-constexpr uint32_t SAMPLE_PERIOD_MS = 100;     // 10 Hz sampling frequency (100 ms interval)
-constexpr uint32_t LED_HOLD_MS      = 250;     // LED pulse duration upon anomaly detection
-
-// 4. STATICALLY ALLOCATED RING BUFFER STRUCTURE
-struct StaticRingBuffer {
-    float data[WINDOW_SIZE];
-    size_t head;
-    size_t count;
-
-    void init() {
-        head = 0;
-        count = 0;
-        for (size_t i = 0; i < WINDOW_SIZE; ++i) {
-            data[i] = 0.0f;
-        }
+static const char* TOPIC_RAW     = "eeair/telemetry/raw";     
+static const char* TOPIC_ANOMALY = "eeair/telemetry/anomaly"; 
+static const char* TOPIC_STATUS  = "eeair/telemetry/status";  
+static const uint8_t PIN_ADC = 36;  
+static const uint8_t PIN_LED = 2; 
+static const float ADC_VREF      = 3.3f;   
+static const float ADC_MAX_COUNT = 4095.0f; 
+static const uint16_t RING_SIZE     = 50;     
+static const float    Z_THRESHOLD   = 2.5f;    
+static const float    SIGMA_EPSILON = 0.0001f; 
+static const uint32_t SAMPLE_PERIOD_MS = 20; 
+static const uint32_t LED_PULSE_MS     = 150; 
+static const uint32_t WIFI_RETRY_MS    = 5000;
+static const uint32_t MQTT_RETRY_MS    = 5000;
+struct RingBuffer {
+  float    data[RING_SIZE];  
+  uint16_t head  = 0;      
+  uint16_t count = 0;       
+  void push(float value) {
+    data[head] = value;
+    head = (uint16_t)((head + 1u) % RING_SIZE);
+    if (count < RING_SIZE) {
+      ++count;
     }
+  }
+  float at(uint16_t i) const {
+    const uint16_t start = (count < RING_SIZE) ? 0u : head;
+    return data[(uint16_t)((start + i) % RING_SIZE)];
+  }
 
-    void push(float sample) {
-        data[head] = sample;
-        head = (head + 1) % WINDOW_SIZE;
-        if (count < WINDOW_SIZE) {
-            count++;
-        }
-    }
-
-    bool isFull() const {
-        return count == WINDOW_SIZE;
-    }
-
-    /**
-    Computes rolling arithmetic mean (mu) across valid samples in buffer.
-    */
-    float computeMean() const {
-        if (count == 0) return 0.0f;
-        float sum = 0.0f;
-        for (size_t i = 0; i < count; ++i) {
-            sum += data[i];
-        }
-        return sum / static_cast<float>(count);
-    }
-
-    /**
-    Computes rolling population standard deviation (sigma).
-    */
-    float computeStdDev(float mean) const {
-        if (count < 2) return 0.0f;
-        float varianceSum = 0.0f;
-        for (size_t i = 0; i < count; ++i) {
-            float diff = data[i] - mean;
-            varianceSum += (diff * diff);
-        }
-        return sqrtf(varianceSum / static_cast<float>(count));
-    }
+  bool full() const { return count == RING_SIZE; }
+  void clear() { head = 0; count = 0; }
 };
+static RingBuffer       g_ring;
+static WiFiClient       g_wifiClient;
+static PubSubClient     g_mqtt(g_wifiClient);
 
-// 5. GLOBAL INSTANCES & TELEMETRY COUNTERS
-WiFiClient espWiFiClient;
-PubSubClient mqttClient(espWiFiClient);
-StaticRingBuffer sensorBuffer;
+static uint32_t g_lastSampleMs = 0;
+static uint32_t g_lastWifiMs   = 0;
+static uint32_t g_lastMqttMs   = 0;
+static uint32_t g_ledOffAt     = 0;
 
-uint32_t totalSamplesProcessed = 0;
-uint32_t totalPacketsPublished = 0;
-uint32_t totalPacketsDropped   = 0;
-uint32_t lastSampleTimestamp   = 0;
-uint32_t ledTurnOffTimestamp   = 0;
-bool isLedActive               = false;
+static uint32_t g_txRawFrames     = 0;
+static uint32_t g_txAnomalyFrames = 0;
+static uint32_t g_txBytes         = 0;
 
-// 6. NETWORK CONNECTIVITY & RECOVERY ROUTINES
-/**
-Establishes Wi-Fi connection with exponential/fixed retry polling.
-*/
-void connectToWiFi() {
-    if (WiFi.status() == WL_CONNECTED) {
-        return;
-    }
 
-    Serial.println();
-    Serial.print(F("[WIFI] Connecting to SSID: "));
-    Serial.println(WIFI_SSID);
+static void computeStats(const RingBuffer& rb, float& mean, float& sigma) {
+  if (rb.count == 0) { mean = 0.0f; sigma = 0.0f; return; }
 
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  float sum = 0.0f;
+  for (uint16_t i = 0; i < rb.count; ++i) sum += rb.at(i);
+  mean = sum / (float)rb.count;
 
-    uint8_t attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 40) {
-        delay(250);
-        Serial.print(F("."));
-        attempts++;
-    }
+  if (rb.count < 2) { sigma = 0.0f; return; }
 
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.println();
-        Serial.print(F("[WIFI] Connected! IPv4 Address: "));
-        Serial.println(WiFi.localIP());
-    } else {
-        Serial.println();
-        Serial.println(F("[WIFI] Connection attempt timed out. Will retry in loop."));
-    }
+  float acc = 0.0f;
+  for (uint16_t i = 0; i < rb.count; ++i) {
+    const float d = rb.at(i) - mean;
+    acc += d * d;
+  }
+  sigma = sqrtf(acc / (float)(rb.count - 1));  
 }
 
-/**
-Ensures active connection to the Eclipse Mosquitto MQTT broker.
-*/
-void ensureMqttConnected() {
-    if (WiFi.status() != WL_CONNECTED) {
-        connectToWiFi();
-        if (WiFi.status() != WL_CONNECTED) return;
-    }
+static void ensureWifi() {
+  if (WiFi.status() == WL_CONNECTED) return;
 
-    while (!mqttClient.connected()) {
-        Serial.print(F("[MQTT] Attempting connection to broker ("));
-        Serial.print(MQTT_BROKER);
-        Serial.print(F(":"));
-        Serial.print(MQTT_PORT);
-        Serial.print(F(")... "));
+  const uint32_t now = millis();
+  if (now - g_lastWifiMs < WIFI_RETRY_MS) return;
+  g_lastWifiMs = now;
 
-        if (mqttClient.connect(MQTT_CLIENT_ID)) {
-            Serial.println(F("CONNECTED."));
-        } else {
-            Serial.print(F("FAILED, rc="));
-            Serial.print(mqttClient.state());
-            Serial.println(F(". Retrying in 2000 ms..."));
-            delay(2000);
-        }
-    }
-}
-// 7. HARDWARE SENSOR ACQUISITION & STATISTICAL FUNCTIONS
-
-/**
-Reads 12-bit ADC value from GPIO36 and converts it to Voltage (0.0 - 3.3V).
-*/
-float readSensorVoltage() {
-    uint16_t rawAdc = analogRead(PIN_ANALOG_SENSOR);
-    return (static_cast<float>(rawAdc) / ADC_MAX_VALUE) * ADC_REF_VOLTAGE;
+  Serial.printf("[WIFI] connecting to \"%s\" ...\n", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 }
 
-/**
-Computes the standardized Z-score: Z = (x - mu) / sigma.
-Uses EPSILON floor to prevent division-by-zero on constant signals.
-*/
-float computeZScore(float sample, float mean, float stdDev) {
-    float safeStdDev = (stdDev < EPSILON) ? EPSILON : stdDev;
-    return (sample - mean) / safeStdDev;
+static void ensureMqtt() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (g_mqtt.connected()) return;
+
+  const uint32_t now = millis();
+  if (now - g_lastMqttMs < MQTT_RETRY_MS) return;
+  g_lastMqttMs = now;
+
+  Serial.printf("[MQTT] connecting to %s:%u ...\n", MQTT_HOST, MQTT_PORT);
+  const bool ok = g_mqtt.connect(
+      MQTT_CLIENT_ID,
+      TOPIC_STATUS, 1, true, "offline");
+
+  if (ok) {
+    Serial.println("[MQTT] connected.");
+    g_mqtt.publish(TOPIC_STATUS, "online", true);
+    g_mqtt.publish(TOPIC_STATUS,
+                   "{\"node\":\"esp32-edge\",\"filter\":\"zscore\","
+                   "\"n\":50,\"z\":2.50,\"state\":\"boot\"}",
+                   true);
+  } else {
+    Serial.printf("[MQTT] failed, rc=%d\n", g_mqtt.state());
+  }
+}
+static void publishRaw(uint32_t tMs, float voltage) {
+  StaticJsonDocument<128> doc;
+  doc["t"] = tMs;
+  doc["v"] = serialized(String(voltage, 4));
+  doc["src"] = "esp32-warmup";
+
+  char payload[128];
+  const size_t len = serializeJson(doc, payload, sizeof(payload));
+
+  if (g_mqtt.publish(TOPIC_RAW, payload, len)) {
+    ++g_txRawFrames;
+    g_txBytes += len;
+  }
+}
+static void publishAnomaly(uint32_t tMs, float voltage,
+                           float mean, float sigma, float z) {
+  StaticJsonDocument<192> doc;
+  doc["t"] = tMs;
+  doc["v"] = serialized(String(voltage, 4));
+  doc["z"] = serialized(String(z, 2));
+  doc["m"] = serialized(String(mean, 4));
+  doc["s"] = serialized(String(sigma, 4));
+
+  char payload[192];
+  const size_t len = serializeJson(doc, payload, sizeof(payload));
+
+  if (g_mqtt.publish(TOPIC_ANOMALY, payload, len)) {
+    ++g_txAnomalyFrames;
+    g_txBytes += len;
+    Serial.printf("[ANOMALY] v=%.4f mu=%.4f sd=%.4f z=%+.2f\n",
+                  voltage, mean, sigma, z);
+  }
+}
+static void serviceLed() {
+  if (g_ledOffAt != 0 && (int32_t)(millis() - g_ledOffAt) >= 0) {
+    digitalWrite(PIN_LED, LOW);
+    g_ledOffAt = 0;
+  }
 }
 
-/**
-Serializes telemetry payload into JSON and publishes via MQTT.
-*/
-bool publishTelemetryPayload(
-    uint32_t sampleId,
-    float voltage,
-    float mean,
-    float stdDev,
-    float zScore,
-    const char* statusLabel
-) {
-    JsonDocument doc;
-    doc["node_id"]     = MQTT_CLIENT_ID;
-    doc["sample_id"]   = sampleId;
-    doc["timestamp"]   = millis();
-    doc["voltage_v"]   = serialized(String(voltage, 4));
-    doc["rolling_mu"]  = serialized(String(mean, 4));
-    doc["rolling_std"] = serialized(String(stdDev, 4));
-    doc["z_score"]     = serialized(String(zScore, 3));
-    doc["threshold"]   = Z_THRESHOLD;
-    doc["status"]      = statusLabel;
-    doc["published"]   = totalPacketsPublished + 1;
-    doc["dropped"]     = totalPacketsDropped;
-
-    char payloadBuffer[320];
-    size_t payloadSize = serializeJson(doc, payloadBuffer, sizeof(payloadBuffer));
-
-    if (payloadSize == 0) {
-        Serial.println(F("[ERROR] JSON serialization failed."));
-        return false;
-    }
-
-    bool success = mqttClient.publish(MQTT_TOPIC, payloadBuffer, false);
-    if (success) {
-        totalPacketsPublished++;
-    }
-    return success;
+static void pulseLed() {
+  digitalWrite(PIN_LED, HIGH);
+  g_ledOffAt = millis() + LED_PULSE_MS;
 }
-
-// 8. ARDUINO LIFECYCLE: SETUP & MAIN LOOP
-
 void setup() {
-    Serial.begin(115200);
-    delay(500);
+  Serial.begin(115200);
+  delay(200);
 
-    Serial.println(F("============================================================"));
-    Serial.println(F(" EEAIR Coursework: Edge Anomaly Stream Filter"));
-    Serial.println(F(" Author: Sulaimanov Baibol (GitHub: CilaNim / cilan1m0)"));
-    Serial.println(F("============================================================"));
+  pinMode(PIN_LED, OUTPUT);
+  digitalWrite(PIN_LED, LOW);
+  analogReadResolution(12);
+  analogSetWidth(12);
+  analogSetPinAttenuation(PIN_ADC, ADC_11db);
 
-    // Configure GPIO pins
-    pinMode(PIN_STATUS_LED, OUTPUT);
-    digitalWrite(PIN_STATUS_LED, LOW);
-    pinMode(PIN_ANALOG_SENSOR, INPUT);
+  g_ring.clear();
+  g_mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  g_mqtt.setKeepAlive(30);
+  g_mqtt.setBufferSize(512);
 
-    // Configure ESP32 12-bit SAR ADC resolution and 11dB attenuation (full 0-3.3V range)
-    analogReadResolution(12);
-    analogSetPinAttenuation(PIN_ANALOG_SENSOR, ADC_11db);
+  Serial.println();
+  Serial.println("==============================================");
+  Serial.println(" Edge Anomaly Stream Filter  |  EEAIR 2026");
+  Serial.println(" Sulaimanov Baibol  (CilaNim / cilan1m0)");
+  Serial.println("==============================================");
+  Serial.printf(" N=%u  Z_THRESHOLD=%.2f  fs=%.0f Hz\n",
+                RING_SIZE, (double)Z_THRESHOLD, 1000.0 / SAMPLE_PERIOD_MS);
 
-    // Initialize static ring buffer
-    sensorBuffer.init();
-
-    // Initialize Wi-Fi and MQTT Broker settings
-    connectToWiFi();
-    mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
-    mqttClient.setBufferSize(512);
+  ensureWifi();
 }
-
 void loop() {
-    // Maintain MQTT broker connection
-    ensureMqttConnected();
-    mqttClient.loop();
+  ensureWifi();
+  ensureMqtt();
+  if (g_mqtt.connected()) g_mqtt.loop();
+  serviceLed();
+  const uint32_t now = millis();
+  if (now - g_lastSampleMs < SAMPLE_PERIOD_MS) return;
+  g_lastSampleMs = now;
+  const int   rawCount = analogRead(PIN_ADC);              
+  const float voltage  = (rawCount * ADC_VREF) / ADC_MAX_COUNT; 
+  g_ring.push(voltage);
 
-    uint32_t currentMillis = millis();
+  if (!g_mqtt.connected()) return;   
+  if (!g_ring.full()) {
+    publishRaw(now, voltage);
+    return;
+  }
+  float mean = 0.0f, sigma = 0.0f;
+  computeStats(g_ring, mean, sigma);
+  if (sigma < SIGMA_EPSILON) {
+    return;
+  }
+  const float z = (voltage - mean) / sigma;
 
-    // Non-blocking turn-off check for Anomaly Status LED (GPIO2)
-    if (isLedActive && (currentMillis >= ledTurnOffTimestamp)) {
-        digitalWrite(PIN_STATUS_LED, LOW);
-        isLedActive = false;
-    }
-
-    // Execute periodic sensor sampling and edge filtering
-    if (currentMillis - lastSampleTimestamp >= SAMPLE_PERIOD_MS) {
-        lastSampleTimestamp = currentMillis;
-        totalSamplesProcessed++;
-
-        float currentVoltage = readSensorVoltage();
-
-        // PHASE A: BUFFER WARM-UP (Samples 1 to 50)
-        if (!sensorBuffer.isFull()) {
-            sensorBuffer.push(currentVoltage);
-            float warmMean = sensorBuffer.computeMean();
-            float warmStd  = sensorBuffer.computeStdDev(warmMean);
-
-            publishTelemetryPayload(
-                totalSamplesProcessed,
-                currentVoltage,
-                warmMean,
-                warmStd,
-                0.0f,
-                "WARMUP"
-            );
-
-            Serial.printf(
-                "[WARMUP %02u/%02u] V=%.4fV | mu=%.4fV | sigma=%.4fV -> PUBLISHED\n",
-                static_cast<unsigned int>(sensorBuffer.count),
-                static_cast<unsigned int>(WINDOW_SIZE),
-                currentVoltage,
-                warmMean,
-                warmStd
-            );
-            return;
-        }
-        // PHASE B: REAL-TIME Z-SCORE EVALUATION AGAINST HISTORICAL BASELINE
-        // Compute baseline statistics prior to inserting the new observation
-        // so that an extreme spike does not corrupt its own baseline mean/std.
-        float rollingMean   = sensorBuffer.computeMean();
-        float rollingStdDev = sensorBuffer.computeStdDev(rollingMean);
-        float zScore        = computeZScore(currentVoltage, rollingMean, rollingStdDev);
-        float absZScore     = fabsf(zScore);
-
-        // Update ring buffer with current observation for subsequent window
-        sensorBuffer.push(currentVoltage);
-
-        // Evaluate dynamic anomaly condition: |Z| >= Z_THRESHOLD
-        if (absZScore >= Z_THRESHOLD) {
-            // Trigger GPIO2 Status LED to indicate anomaly transmission
-            digitalWrite(PIN_STATUS_LED, HIGH);
-            isLedActive = true;
-            ledTurnOffTimestamp = currentMillis + LED_HOLD_MS;
-
-            publishTelemetryPayload(
-                totalSamplesProcessed,
-                currentVoltage,
-                rollingMean,
-                rollingStdDev,
-                zScore,
-                "ANOMALY"
-            );
-
-            float savingsPct = (static_cast<float>(totalPacketsDropped) /
-                                static_cast<float>(totalSamplesProcessed)) * 100.0f;
-
-            Serial.printf(
-                "[ANOMALY] Sample #%lu | V=%.4fV | mu=%.4fV | sigma=%.4fV | Z=%+.2f >= %.2f -> SENT (Saved: %.1f%%)\n",
-                totalSamplesProcessed,
-                currentVoltage,
-                rollingMean,
-                rollingStdDev,
-                zScore,
-                Z_THRESHOLD,
-                savingsPct
-            );
-        } else {
-            // Drop routine sample at the edge node to conserve bandwidth
-            totalPacketsDropped++;
-
-            float savingsPct = (static_cast<float>(totalPacketsDropped) /
-                                static_cast<float>(totalSamplesProcessed)) * 100.0f;
-
-            Serial.printf(
-                "[FILTERED] Sample #%lu | V=%.4fV | Z=%+.2f < %.2f -> DROPPED AT EDGE (Saved: %.1f%%)\n",
-                totalSamplesProcessed,
-                currentVoltage,
-                zScore,
-                Z_THRESHOLD,
-                savingsPct
-            );
-        }
-    }
+  if (fabsf(z) >= Z_THRESHOLD) {
+    publishAnomaly(now, voltage, mean, sigma, z);
+    pulseLed();           
+  }
+  static uint32_t lastReportMs = 0;
+  if (now - lastReportMs >= 10000) {
+    lastReportMs = now;
+    Serial.printf("[STAT] win=%u/%u  mu=%.4f sd=%.4f  raw=%lu anom=%lu bytes=%lu\n",
+                  g_ring.count, RING_SIZE, mean, sigma,
+                  (unsigned long)g_txRawFrames,
+                  (unsigned long)g_txAnomalyFrames,
+                  (unsigned long)g_txBytes);
+  }
 }
