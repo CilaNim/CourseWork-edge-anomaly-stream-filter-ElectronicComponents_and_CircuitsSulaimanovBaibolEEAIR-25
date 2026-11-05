@@ -1,0 +1,7 @@
+threshold_sigma,packets_sent,bytes_sent,baseline_packets,baseline_bytes,bandwidth_reduction_pct,spikes_injected,spikes_missed,false_negative_rate_pct
+1.0,2150,164400,6000,324000,49.26,300,0,0.0
+1.5,1070,81240,6000,324000,74.93,300,0,0.0
+2.0,590,44280,6000,324000,86.33,300,0,0.0
+2.5,422,31344,6000,324000,90.33,300,0,0.0
+3.0,359,26493,6000,324000,91.82,300,15,5.0
+3.5,324,23798,6000,324000,92.65,300,33,11.0
