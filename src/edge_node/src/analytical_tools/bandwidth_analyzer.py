@@ -1,331 +1,365 @@
+#!/usr/bin/env python3
 """
-File: src/analytical_tools/bandwidth_analyzer.py
-Author: Sulaimanov Baibol (GitHub: cilan1m0 / CilaNim)
-Course: Electronic Components and Circuits (EEAIR)
-Description:
-    Evaluates bandwidth savings and critical anomaly recall across Z-score
-    thresholds sigma in {1.0, 1.5, 2.0, 2.5, 3.0, 3.5} over a 120-second window
-    (1,200 samples at 10 Hz) and saves a dual-axis Matplotlib performance plot
-    to docs/photos/bandwidth_reduction_chart.png.
+bandwidth_analyzer.py
+=====================
+Quantifies the bandwidth reduction obtained by the ESP32 edge Z-score filter.
+
+METHOD
+------
+1. Subscribes to  eeair/telemetry/raw  (the unfiltered ground-truth stream
+   produced either by `sensor_emulator.py` or by the ESP32 during warm-up).
+2. For every incoming raw frame it *simultaneously* replays six independent
+   digital twins of the firmware filter, one per threshold
+   sigma in {1.0, 1.5, 2.0, 2.5, 3.0, 3.5}. Each twin is a bit-exact
+   re-implementation of `main.cpp`: identical 50-slot ring buffer, identical
+   Bessel-corrected sigma, identical zero-division guard, identical JSON
+   payload layout.
+3. Each frame that a twin would publish is charged the exact number of bytes
+   that would appear on the wire (MQTT fixed header + topic length + payload).
+4. At the end of the 120-second window the script reports, per threshold:
+       - total transmitted bytes vs. the unfiltered baseline
+       - bandwidth reduction (%)
+       - number of injected spikes that were NOT flagged (false negatives)
+5. Results are written to  data/threshold_sweep_results.csv  and plotted to
+   docs/photos/bandwidth_reduction_chart.png
+
+A second measurement channel counts the *actual* bytes arriving on
+eeair/telemetry/anomaly, i.e. what the real ESP32 sent. This validates that
+the Python twin matches the firmware.
+
+Course : Electronic Components and Circuits (EEAIR)
+Author : Sulaimanov Baibol (CilaNim / cilan1m0)
 """
+
+from __future__ import annotations
 
 import argparse
+import csv
 import json
-import os
+import sys
 import time
-from dataclasses import dataclass
-from typing import Dict, List
+from collections import deque
+from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")                    
 import matplotlib.pyplot as plt
+import numpy as np
 import paho.mqtt.client as mqtt
 
-from sensor_emulator import EdgeSensorEmulator
+TOPIC_RAW     = "eeair/telemetry/raw"
+TOPIC_ANOMALY = "eeair/telemetry/anomaly"
+TOPIC_STATUS  = "eeair/telemetry/status"
 
+RING_N     = 50
+SIGMA_EPS  = 1e-4
+THRESHOLDS = [1.0, 1.5, 2.0, 2.5, 3.0, 3.5]
 
-@dataclass
-class BenchmarkMetrics:
-    sigma_threshold: float
-    total_samples: int
-    steady_state_samples: int
-    warmup_packets: int
-    anomaly_packets: int
-    total_packets_sent: int
-    packets_dropped: int
-    unfiltered_bytes_total: int
-    filtered_bytes_total: int
-    unfiltered_bytes_steady: int
-    filtered_bytes_steady: int
-    total_bandwidth_savings_pct: float
-    steady_bandwidth_savings_pct: float
-    ground_truth_spikes: int
-    detected_spikes: int
-    missed_spikes: int
-    missed_spike_rate_pct: float
-    false_positives: int
+CSV_PATH   = Path("data/threshold_sweep_results.csv")
+CHART_PATH = Path("docs/photos/bandwidth_reduction_chart.png")
 
+def mqtt_packet_bytes(topic: str, payload: str, qos: int = 0) -> int:
+    """
+    Exact byte count of a single MQTT 3.1.1 PUBLISH control packet.
+
+        fixed header   = 1 (type/flags) + N (remaining-length varint)
+        variable header= 2 (topic length) + len(topic) [+ 2 (packet id) if qos>0]
+        payload        = len(payload)
+    """
+    topic_len = len(topic.encode("utf-8"))
+    body = 2 + topic_len + len(payload.encode("utf-8")) + (2 if qos > 0 else 0)
+
+    varint = 1
+    remaining = body
+    while remaining >= 128:
+        remaining //= 128
+        varint += 1
+
+    return 1 + varint + body
+
+class ZFilterTwin:
+    """Bit-exact Python replica of the firmware's edge filter."""
+
+    def __init__(self, z_threshold: float, n: int = RING_N) -> None:
+        self.z = z_threshold
+        self.n = n
+        self.buf: deque[float] = deque(maxlen=n)
+        self.warm = True
+
+    def process(self, t_ms: int, value: float):
+        """
+        Returns (published: bool, payload: str | None, status: str)
+        status in {"warmup", "flat", "nominal", "anomaly"}
+        """
+        self.buf.append(value)
+
+        if len(self.buf) < self.n:
+            self.warm = True
+            payload = json.dumps(
+                {"t": t_ms, "v": round(value, 4), "src": "esp32-warmup"},
+                separators=(",", ":"),
+            )
+            return True, payload, "warmup"
+
+        self.warm = False
+        arr = np.fromiter(self.buf, dtype=np.float64, count=self.n)
+        mu = float(arr.mean())
+        sd = float(arr.std(ddof=1))
+
+        if sd < SIGMA_EPS:                     
+            return False, None, "flat"
+
+        z = (value - mu) / sd
+        if abs(z) >= self.z:
+            payload = json.dumps(
+                {"t": t_ms,
+                 "v": round(value, 4),
+                 "z": round(z, 2),
+                 "m": round(mu, 4),
+                 "s": round(sd, 4)},
+                separators=(",", ":"),
+            )
+            return True, payload, "anomaly"
+
+        return False, None, "nominal"
 
 class BandwidthAnalyzer:
-    """Measures MQTT traffic volume and anomaly detection recall across thresholds."""
+    def __init__(self, host: str, port: int, client_id: str, duration: float):
+        self.host = host
+        self.port = port
+        self.client_id = client_id
+        self.duration = duration
 
-    SIGMA_SWEEP: List[float] = [1.0, 1.5, 2.0, 2.5, 3.0, 3.5]
+        self.twins = {thr: ZFilterTwin(thr) for thr in THRESHOLDS}
+        self.bytes_out = {thr: 0 for thr in THRESHOLDS}
+        self.packets_out = {thr: 0 for thr in THRESHOLDS}
 
-    def __init__(self, broker_host: str = "127.0.0.1", broker_port: int = 1883) -> None:
-        self.broker_host = broker_host
-        self.broker_port = broker_port
-        self.raw_topic = "eeair/cilan1m0/edge/raw_reference"
-        self.filtered_topic = "eeair/cilan1m0/edge/telemetry"
+        self.baseline_bytes = 0
+        self.baseline_packets = 0
 
-        self.raw_records: List[Dict] = []
-        self.filtered_records: List[Dict] = []
+        self.spikes_total = 0
+        self.spikes_missed = {thr: 0 for thr in THRESHOLDS}
 
-    def _clear_records(self) -> None:
-        self.raw_records.clear()
-        self.filtered_records.clear()
+        self.device_anomaly_bytes = 0
+        self.device_anomaly_packets = 0
 
-    def _on_mqtt_message(
-        self, client: mqtt.Client, userdata: None, msg: mqtt.MQTTMessage
-    ) -> None:
-        record = json.loads(msg.payload.decode("utf-8"))
-        record["_byte_size"] = len(msg.payload)
-        if msg.topic == self.raw_topic:
-            self.raw_records.append(record)
-        elif msg.topic == self.filtered_topic:
-            self.filtered_records.append(record)
+        self.t0 = 0.0
+        self.finished = False
+        self.client = self._make_client()
 
-    def evaluate_threshold(
-        self, sigma: float, duration_s: float = 120.0, use_live_broker: bool = True
-    ) -> BenchmarkMetrics:
-        """Runs a 120-second evaluation for a specific Z-score threshold."""
-        self._clear_records()
-        emulator = EdgeSensorEmulator(
-            broker_host=self.broker_host,
-            broker_port=self.broker_port,
-            z_threshold=sigma,
-            random_seed=2026,
-        )
-        total_steps = int(duration_s / emulator.sample_period_s)
+    def _make_client(self) -> mqtt.Client:
+        try:                                 
+            c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1,
+                            client_id=self.client_id)
+        except AttributeError:              
+            c = mqtt.Client(client_id=self.client_id)
 
-        if use_live_broker:
-            subscriber = mqtt.Client(client_id=f"analyzer_cilan1m0_{sigma:.1f}")
-            subscriber.on_message = self._on_mqtt_message
-            try:
-                subscriber.connect(self.broker_host, self.broker_port, keepalive=60)
-                subscriber.subscribe([(self.raw_topic, 0), (self.filtered_topic, 0)])
-                subscriber.loop_start()
-                emulator.connect_broker()
-                time.sleep(0.15)
+        c.on_connect = self._on_connect
+        c.on_message = self._on_message
+        return c
 
-                for idx in range(total_steps):
-                    emulator.step_simulation(idx * emulator.sample_period_s, publish_mqtt=True)
+    def _on_connect(self, client, userdata, flags, rc): 
+        print(f"[AN] connected (rc={rc}); subscribing ...")
+        client.subscribe(TOPIC_RAW, qos=0)
+        client.subscribe(TOPIC_ANOMALY, qos=0)
 
-                time.sleep(0.35)
-                emulator.disconnect_broker()
-                subscriber.loop_stop()
-                subscriber.disconnect()
-            except Exception as err:
-                print(
-                    f"[ANALYZER] Local broker not detected ({err}). "
-                    f"Using direct deterministic packet inspection."
-                )
-                use_live_broker = False
+    def _on_message(self, client, userdata, msg):       
+        if self.finished:
+            return
 
-        if not use_live_broker or len(self.raw_records) < total_steps:
-            self._clear_records()
-            emulator = EdgeSensorEmulator(
-                broker_host=self.broker_host,
-                broker_port=self.broker_port,
-                z_threshold=sigma,
-                random_seed=2026,
+        topic = msg.topic
+        payload = msg.payload.decode("utf-8", errors="replace")
+
+        if topic == TOPIC_RAW:
+            self._handle_raw(payload)
+
+        elif topic == TOPIC_ANOMALY:
+            self.device_anomaly_bytes += mqtt_packet_bytes(topic, payload)
+            self.device_anomaly_packets += 1
+
+    def _handle_raw(self, payload: str) -> None:
+        try:
+            frame = json.loads(payload)
+            t_ms = int(frame.get("t", 0))
+            value = float(frame["v"])
+            gt = int(frame.get("gt", 0))
+        except (ValueError, KeyError, TypeError):
+            return                             
+        self.baseline_bytes += mqtt_packet_bytes(TOPIC_RAW, payload)
+        self.baseline_packets += 1
+
+        if gt:
+            self.spikes_total += 1
+
+        for thr, twin in self.twins.items():
+            published, out_payload, status = twin.process(t_ms, value)
+
+            if published and out_payload is not None:
+                topic = TOPIC_RAW if status == "warmup" else TOPIC_ANOMALY
+                self.bytes_out[thr] += mqtt_packet_bytes(topic, out_payload)
+                self.packets_out[thr] += 1
+
+            if gt and status != "anomaly":
+                self.spikes_missed[thr] += 1
+
+    def run(self) -> None:
+        print(f"[AN] connecting to {self.host}:{self.port} ...")
+        self.client.connect(self.host, self.port, keepalive=60)
+        self.client.loop_start()
+
+        self.t0 = time.monotonic()
+        next_report = 10.0
+
+        try:
+            while True:
+                elapsed = time.monotonic() - self.t0
+                if elapsed >= self.duration:
+                    break
+                if elapsed >= next_report:
+                    print(f"[AN] {elapsed:5.1f}s  raw={self.baseline_packets:6d} "
+                          f"dev_anom={self.device_anomaly_packets:5d}")
+                    next_report += 10.0
+                time.sleep(0.05)
+        finally:
+            self.finished = True
+            self.client.loop_stop()
+            self.client.disconnect()
+
+        print(f"[AN] window closed after {self.duration:.1f} s.")
+
+    def results(self) -> list[dict]:
+        rows = []
+        for thr in THRESHOLDS:
+            sent = self.bytes_out[thr]
+            reduction = 0.0
+            if self.baseline_bytes > 0:
+                reduction = 100.0 * (1.0 - sent / self.baseline_bytes)
+            missed = self.spikes_missed[thr]
+            fnr = (100.0 * missed / self.spikes_total) if self.spikes_total else 0.0
+            rows.append({
+                "threshold_sigma": thr,
+                "packets_sent": self.packets_out[thr],
+                "bytes_sent": sent,
+                "baseline_packets": self.baseline_packets,
+                "baseline_bytes": self.baseline_bytes,
+                "bandwidth_reduction_pct": round(reduction, 2),
+                "spikes_injected": self.spikes_total,
+                "spikes_missed": missed,
+                "false_negative_rate_pct": round(fnr, 2),
+            })
+        return rows
+
+    def print_table(self, rows: list[dict]) -> None:
+        print()
+        print("=" * 96)
+        print(" THRESHOLD SWEEP RESULTS  (window = %.0f s)" % self.duration)
+        print("=" * 96)
+        print(f"{'sigma':>6} | {'packets':>8} | {'bytes':>10} | "
+              f"{'reduction %':>12} | {'missed':>7} | {'FNR %':>7}")
+        print("-" * 96)
+        for r in rows:
+            print(f"{r['threshold_sigma']:>6.1f} | {r['packets_sent']:>8d} | "
+                  f"{r['bytes_sent']:>10d} | "
+                  f"{r['bandwidth_reduction_pct']:>12.2f} | "
+                  f"{r['spikes_missed']:>7d} | "
+                  f"{r['false_negative_rate_pct']:>7.2f}")
+        print("-" * 96)
+        print(f" baseline: {self.baseline_packets} packets / "
+              f"{self.baseline_bytes} bytes")
+        print(f" injected critical events (ground truth): {self.spikes_total}")
+        print(f" device-reported anomaly traffic: "
+              f"{self.device_anomaly_packets} packets / "
+              f"{self.device_anomaly_bytes} bytes")
+        print("=" * 96)
+        print()
+
+    def save_csv(self, rows: list[dict]) -> None:
+        CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with CSV_PATH.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"[AN] CSV written -> {CSV_PATH}")
+
+    def save_chart(self, rows: list[dict]) -> None:
+        CHART_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+        sigmas     = [r["threshold_sigma"] for r in rows]
+        reductions = [r["bandwidth_reduction_pct"] for r in rows]
+        fnrs       = [r["false_negative_rate_pct"] for r in rows]
+
+        fig, ax1 = plt.subplots(figsize=(10, 6))
+
+        ax1.plot(sigmas, reductions, marker="o", linewidth=2.2,
+                 color="#1f77b4", label="Bandwidth reduction (%)")
+        ax1.axhline(40.0, linestyle="--", linewidth=1.2, color="#2ca02c",
+                    label="Research target: 40 % reduction")
+        ax1.axhline(90.0, linestyle=":", linewidth=1.2, color="#9467bd",
+                    label="Stretch goal: 90 % reduction")
+        ax1.set_xlabel(r"Anomaly threshold  $Z_{\mathrm{TH}}$  ($\sigma$ units)",
+                       fontsize=12)
+        ax1.set_ylabel("Bandwidth reduction (%)", color="#1f77b4", fontsize=12)
+        ax1.tick_params(axis="y", labelcolor="#1f77b4")
+        ax1.set_xticks(sigmas)
+        ax1.grid(True, alpha=0.30)
+        ax1.set_ylim(0, 105)
+
+        ax2 = ax1.twinx()
+        ax2.plot(sigmas, fnrs, marker="s", linewidth=2.0, linestyle="--",
+                 color="#d62728", label="Missed critical events (FNR %)")
+        ax2.set_ylabel("False-negative rate (%)", color="#d62728", fontsize=12)
+        ax2.tick_params(axis="y", labelcolor="#d62728")
+        ax2.set_ylim(0, max(10.0, max(fnrs) * 1.4 + 1.0))
+
+
+        if 2.5 in sigmas:
+            idx = sigmas.index(2.5)
+            ax1.axvline(2.5, color="#ff7f0e", linestyle="-.", linewidth=1.4)
+            ax1.annotate(
+                f"Selected operating point\n"
+                f"σ = 2.5  →  {reductions[idx]:.1f} % saved\n"
+                f"FNR = {fnrs[idx]:.1f} %",
+                xy=(2.5, reductions[idx]),
+                xytext=(2.9, reductions[idx] - 28),
+                fontsize=10,
+                arrowprops=dict(arrowstyle="->", color="#ff7f0e"),
+                bbox=dict(boxstyle="round,pad=0.35", fc="#fff7e6", ec="#ff7f0e"),
             )
-            for idx in range(total_steps):
-                pkt = emulator.step_simulation(
-                    idx * emulator.sample_period_s, publish_mqtt=False
-                )
-                self.raw_records.append(pkt)
-                if pkt["status"] in ("WARMUP", "ANOMALY"):
-                    self.filtered_records.append(pkt)
 
-        total_samples = len(self.raw_records)
-        warmup_pkts = sum(1 for r in self.filtered_records if r["status"] == "WARMUP")
-        anomaly_pkts = sum(1 for r in self.filtered_records if r["status"] == "ANOMALY")
-        total_sent = len(self.filtered_records)
-        dropped_pkts = total_samples - total_sent
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2,
+                   loc="lower right", fontsize=9, framealpha=0.95)
 
-        steady_raw = [r for r in self.raw_records if r["status"] != "WARMUP"]
-        steady_filtered = [r for r in self.filtered_records if r["status"] == "ANOMALY"]
-
-        raw_bytes_total = sum(r["_byte_size"] for r in self.raw_records)
-        filtered_bytes_total = sum(r["_byte_size"] for r in self.filtered_records)
-        raw_bytes_steady = sum(r["_byte_size"] for r in steady_raw)
-        filtered_bytes_steady = sum(r["_byte_size"] for r in steady_filtered)
-
-        total_savings_pct = (
-            1.0 - (filtered_bytes_total / max(1, raw_bytes_total))
-        ) * 100.0
-        steady_savings_pct = (
-            1.0 - (filtered_bytes_steady / max(1, raw_bytes_steady))
-        ) * 100.0
-
-        true_spikes = sum(1 for r in steady_raw if r["is_ground_truth_spike"])
-        caught_spikes = sum(1 for r in steady_filtered if r["is_ground_truth_spike"])
-        missed_spikes = true_spikes - caught_spikes
-        missed_rate_pct = (missed_spikes / max(1, true_spikes)) * 100.0
-        false_positives = sum(1 for r in steady_filtered if not r["is_ground_truth_spike"])
-
-        return BenchmarkMetrics(
-            sigma_threshold=sigma,
-            total_samples=total_samples,
-            steady_state_samples=len(steady_raw),
-            warmup_packets=warmup_pkts,
-            anomaly_packets=anomaly_pkts,
-            total_packets_sent=total_sent,
-            packets_dropped=dropped_pkts,
-            unfiltered_bytes_total=raw_bytes_total,
-            filtered_bytes_total=filtered_bytes_total,
-            unfiltered_bytes_steady=raw_bytes_steady,
-            filtered_bytes_steady=filtered_bytes_steady,
-            total_bandwidth_savings_pct=total_savings_pct,
-            steady_bandwidth_savings_pct=steady_savings_pct,
-            ground_truth_spikes=true_spikes,
-            detected_spikes=caught_spikes,
-            missed_spikes=missed_spikes,
-            missed_spike_rate_pct=missed_rate_pct,
-            false_positives=false_positives,
-        )
-
-    def run_full_sweep(
-        self, duration_s: float = 120.0, use_live_broker: bool = True
-    ) -> List[BenchmarkMetrics]:
-        summary: List[BenchmarkMetrics] = []
-        print("=" * 94)
-        print(
-            f"{'Sigma':>6} | {'Sent/1200':>10} | {'Steady Sent':>11} | "
-            f"{'Total Saved':>11} | {'Steady Saved':>12} | {'False Pos':>9} | {'Missed Events':>13}"
-        )
-        print("-" * 94)
-
-        for sigma in self.SIGMA_SWEEP:
-            metrics = self.evaluate_threshold(
-                sigma=sigma, duration_s=duration_s, use_live_broker=use_live_broker
-            )
-            summary.append(metrics)
-            print(
-                f"{metrics.sigma_threshold:6.1f} | "
-                f"{metrics.total_packets_sent:10d} | "
-                f"{metrics.anomaly_packets:11d} | "
-                f"{metrics.total_bandwidth_savings_pct:10.2f}% | "
-                f"{metrics.steady_bandwidth_savings_pct:11.2f}% | "
-                f"{metrics.false_positives:9d} | "
-                f"{metrics.missed_spike_rate_pct:12.2f}%"
-            )
-        print("=" * 94)
-        return summary
-
-    @staticmethod
-    def plot_results(
-        metrics_list: List[BenchmarkMetrics],
-        output_file: str = "docs/photos/bandwidth_reduction_chart.png",
-    ) -> None:
-        """Generates and saves the Matplotlib bandwidth vs. missed anomaly chart."""
-        os.makedirs(os.path.dirname(output_file), exist_ok=True)
-
-        sigmas = [m.sigma_threshold for m in metrics_list]
-        steady_saved = [m.steady_bandwidth_savings_pct for m in metrics_list]
-        total_saved = [m.total_bandwidth_savings_pct for m in metrics_list]
-        missed_pct = [m.missed_spike_rate_pct for m in metrics_list]
-
-        plt.rcParams.update({"font.size": 11, "font.family": "sans-serif"})
-        fig, ax_left = plt.subplots(figsize=(10.5, 6.2), dpi=300)
-
-        l1 = ax_left.plot(
-            sigmas,
-            steady_saved,
-            marker="o",
-            linewidth=2.6,
-            markersize=8,
-            color="#1f77b4",
-            label="Steady-State Bandwidth Savings (%)",
-        )
-        l2 = ax_left.plot(
-            sigmas,
-            total_saved,
-            marker="s",
-            linestyle="--",
-            linewidth=2.0,
-            markersize=7,
-            color="#2ca02c",
-            label="Total Bandwidth Savings incl. N=50 Warm-Up (%)",
-        )
-        ax_left.axhline(
-            40.0,
-            color="#7f7f7f",
-            linestyle=":",
-            linewidth=1.5,
-            label="Target Research Threshold (>40% Savings)",
-        )
-
-        ax_left.set_xlabel("Z-Score Anomaly Threshold ($\\sigma$)", fontsize=12, fontweight="bold")
-        ax_left.set_ylabel("Cloud Bandwidth Reduction (%)", fontsize=12, fontweight="bold", color="#1f77b4")
-        ax_left.set_ylim(0, 105)
-        ax_left.set_xticks(sigmas)
-        ax_left.grid(True, linestyle="--", alpha=0.45)
-
-        ax_right = ax_left.twinx()
-        l3 = ax_right.plot(
-            sigmas,
-            missed_pct,
-            marker="^",
-            linewidth=2.6,
-            markersize=8,
-            color="#d62728",
-            label="Missed Critical Anomaly Rate (%)",
-        )
-        ax_right.set_ylabel(
-            "Missed Critical Anomaly Rate (%)",
-            fontsize=12,
-            fontweight="bold",
-            color="#d62728",
-        )
-        ax_right.set_ylim(-2, 45)
-
-        opt = next(m for m in metrics_list if abs(m.sigma_threshold - 2.5) < 1e-3)
-        ax_left.axvline(2.5, color="#ff7f0e", linestyle="-.", linewidth=1.8, alpha=0.85)
-        ax_left.annotate(
-            f"Optimal Operating Point ($\\sigma = 2.5$)\n"
-            f"Steady Savings: {opt.steady_bandwidth_savings_pct:.2f}%\n"
-            f"Total Savings: {opt.total_bandwidth_savings_pct:.2f}%\n"
-            f"Missed Anomalies: {opt.missed_spike_rate_pct:.2f}%",
-            xy=(2.5, opt.steady_bandwidth_savings_pct),
-            xytext=(1.62, 58.0),
-            arrowprops=dict(facecolor="#ff7f0e", shrink=0.08, width=1.5, headwidth=7),
-            bbox=dict(boxstyle="round,pad=0.5", facecolor="#fff8dc", edgecolor="#ff7f0e", lw=1.5),
-            fontsize=10,
-            fontweight="bold",
-        )
-
-        all_lines = l1 + l2 + l3
-        all_labels = [line.get_label() for line in all_lines]
-        ax_left.legend(all_lines, all_labels, loc="center left", frameon=True, framealpha=0.95)
-
-        plt.title(
-            "Edge Anomaly Stream Filter: Cloud Bandwidth Reduction vs. Missed Critical Events\n"
-            "Author: Sulaimanov Baibol (@cilan1m0) | Ring Buffer N=50 | 120s Window (1,200 Samples)",
-            fontsize=12,
-            fontweight="bold",
-            pad=14,
-        )
+        plt.title("Edge Z-Score Filter — Bandwidth Reduction vs. Missed Events\n"
+                  "ESP32 / GPIO36 · 50-sample window · 120 s capture",
+                  fontsize=12.5, fontweight="bold")
         fig.tight_layout()
-        fig.savefig(output_file, dpi=300)
+        fig.savefig(CHART_PATH, dpi=200, bbox_inches="tight")
         plt.close(fig)
-        print(f"[ANALYZER] Chart successfully saved to: {output_file}")
+        print(f"[AN] chart written -> {CHART_PATH}")
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Edge-filter bandwidth analyzer")
+    p.add_argument("--host", default="test.mosquitto.org")
+    p.add_argument("--port", type=int, default=1883)
+    p.add_argument("--client-id", default="eeair-analyzer-cilan1m0")
+    p.add_argument("--duration", type=float, default=120.0,
+                   help="capture window in seconds (default 120)")
+    return p.parse_args()
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Bandwidth Savings & Anomaly Recall Analyzer across Z-Thresholds"
-    )
-    parser.add_argument("--host", type=str, default="127.0.0.1", help="MQTT Broker Host")
-    parser.add_argument("--port", type=int, default=1883, help="MQTT Broker Port")
-    parser.add_argument("--duration", type=float, default=120.0, help="Analysis duration (s)")
-    parser.add_argument(
-        "--offline",
-        action="store_true",
-        help="Run deterministic evaluation without requiring a live Mosquitto daemon",
-    )
-    parser.add_argument(
-        "--output",
-        type=str,
-        default="docs/photos/bandwidth_reduction_chart.png",
-        help="Output chart path",
-    )
-    args = parser.parse_args()
-
-    analyzer = BandwidthAnalyzer(broker_host=args.host, broker_port=args.port)
-    results = analyzer.run_full_sweep(
-        duration_s=args.duration, use_live_broker=not args.offline
-    )
-    analyzer.plot_results(results, output_file=args.output)
+def main() -> int:
+    args = parse_args()
+    analyzer = BandwidthAnalyzer(args.host, args.port, args.client_id,
+                                 args.duration)
+    print("[AN] start the emulator (or power the ESP32) in another terminal.")
+    analyzer.run()
+    rows = analyzer.results()
+    analyzer.print_table(rows)
+    analyzer.save_csv(rows)
+    analyzer.save_chart(rows)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
