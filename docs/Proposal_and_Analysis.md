@@ -1,1 +1,1 @@
-<img width="2752" height="1536" alt="screenshot82348328" src="https://github.com/user-attachments/assets/9b29b936-2488-4b39-b3c7-813f6c8c5c4a" />
+https://docs.google.com/document/d/1h9EvkFKH7xdd0qq_dyEVHXL61_5bUBwm/edit?usp=drive_link&ouid=109523237885051786093&rtpof=true&sd=true
