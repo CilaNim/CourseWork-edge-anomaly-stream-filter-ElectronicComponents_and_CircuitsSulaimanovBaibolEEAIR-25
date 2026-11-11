@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "author": "Sulaimanov Baibol (cilan1m0)",
+  "editor": "wokwi",
+  "parts": [
+    { "type": "board-esp32-devkit-c-v4", "id": "esp", "top": 0, "left": 0, "attrs": {} },
+    {
+      "type": "wokwi-potentiometer",
+      "id": "pot1",
+      "top": -10,
+      "left": -150,
+      "attrs": { "value": "512" }
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "r1",
+      "top": 205,
+      "left": 175,
+      "rotate": 0,
+      "attrs": { "value": "220" }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "led1",
+      "top": 140,
+      "left": 260,
+      "attrs": { "color": "red", "label": "ANOMALY" }
+    }
+  ],
+  "connections": [
+    [ "esp:TX", "$serialMonitor:RX", "", [] ],
+    [ "esp:RX", "$serialMonitor:TX", "", [] ],
+    [ "pot1:VCC", "esp:3V3", "red", [ "v20", "h0" ] ],
+    [ "pot1:GND", "esp:GND.1", "black", [ "v30", "h0" ] ],
+    [ "pot1:SIG", "esp:VP", "green", [ "v40", "h0" ] ],
+    [ "esp:2", "r1:1", "orange", [ "h0" ] ],
+    [ "r1:2", "led1:A", "orange", [ "v0" ] ],
+    [ "led1:C", "esp:GND.2", "black", [ "v0" ] ]
+  ],
+  "dependencies": {}
+}

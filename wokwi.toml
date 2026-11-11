@@ -1,0 +1,6 @@
+# Wokwi for VS Code / PlatformIO: simulates the firmware built by `pio run -e esp32dev`
+# with the circuit described in diagram.json.
+[wokwi]
+version = 1
+firmware = ".pio/build/esp32dev/firmware.bin"
+elf = ".pio/build/esp32dev/firmware.elf"

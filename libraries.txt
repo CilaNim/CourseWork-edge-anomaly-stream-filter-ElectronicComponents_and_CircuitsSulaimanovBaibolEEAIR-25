@@ -1,0 +1,3 @@
+# Wokwi (wokwi.com) library list for the web simulation of src/edge_node/main.cpp
+PubSubClient
+ArduinoJson
